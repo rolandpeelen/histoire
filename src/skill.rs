@@ -9,6 +9,10 @@ use crate::db::SCHEMA_SQL;
 /// separate file so it can be edited without touching Rust source.
 const SKILL_TEMPLATE: &str = include_str!("skill_template.md");
 
+fn render() -> String {
+    SKILL_TEMPLATE.replace("{{SCHEMA_DDL}}", SCHEMA_SQL.trim())
+}
+
 pub fn run(args: &SkillArgs) -> Result<()> {
     let body = render();
 
@@ -29,10 +33,6 @@ pub fn run(args: &SkillArgs) -> Result<()> {
         .with_context(|| format!("writing skill to {}", args.output.display()))?;
     info!("wrote {}", args.output.display());
     Ok(())
-}
-
-fn render() -> String {
-    SKILL_TEMPLATE.replace("{{SCHEMA_DDL}}", SCHEMA_SQL.trim())
 }
 
 #[cfg(test)]

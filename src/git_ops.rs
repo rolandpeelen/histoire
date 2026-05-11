@@ -7,6 +7,85 @@ use std::path::Path;
 
 use crate::db::FileEventType;
 
+/// Builds contiguous `(start, end_inclusive)` ranges from a stream of added
+/// line numbers seen in source order.
+#[derive(Default)]
+struct AddedRangeCollector {
+    ranges: Vec<(u32, u32)>,
+    current: Option<(u32, u32)>,
+}
+
+impl AddedRangeCollector {
+    fn push(&mut self, line: u32) {
+        match self.current {
+            Some((start, end)) if line == end + 1 => self.current = Some((start, line)),
+            Some(range) => {
+                self.ranges.push(range);
+                self.current = Some((line, line));
+            }
+            None => self.current = Some((line, line)),
+        }
+    }
+
+    fn finish(mut self) -> Vec<(u32, u32)> {
+        if let Some(range) = self.current.take() {
+            self.ranges.push(range);
+        }
+        self.ranges
+    }
+}
+
+/// Metadata about a commit, including the parent SHAs in order.
+#[derive(Debug, Clone)]
+pub struct CommitInfo {
+    pub sha: String,
+    pub tree_sha: String,
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    pub authored_at: Option<String>,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
+    pub committed_at: Option<String>,
+    pub committed_naive: Option<NaiveDate>,
+    pub message: String,
+    pub parents: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffHunkInfo {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub patch_text: String,
+    /// Contiguous added-line ranges on the new side, each `(start, end_inclusive)`.
+    pub added_ranges: Vec<(u32, u32)>,
+}
+
+/// One parsed delta from a diff: the event itself plus its hunks (if textual).
+#[derive(Debug, Clone)]
+pub struct DiffFileEvent {
+    pub event_type: FileEventType,
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    pub old_blob_sha: Option<String>,
+    pub new_blob_sha: Option<String>,
+    pub is_binary: bool,
+    pub hunks: Vec<DiffHunkInfo>,
+}
+
+/// One row from a clipped blame run: a contiguous span on the requested side
+/// attributed to a single ancestor commit.
+#[derive(Debug, Clone)]
+pub struct BlameSpan {
+    pub blamed_commit_sha: String,
+    pub final_start_line: u32,
+    pub line_count: u32,
+    pub origin_path: Option<String>,
+    pub origin_start_line: Option<u32>,
+    pub boundary: bool,
+}
+
 pub fn open_repo() -> Result<Repository> {
     Repository::discover(".").context("not inside a Git repository")
 }
@@ -60,20 +139,10 @@ pub fn compute_diff<'repo>(
     Ok(diff)
 }
 
-/// Metadata about a commit, including the parent SHAs in order.
-#[derive(Debug, Clone)]
-pub struct CommitInfo {
-    pub sha: String,
-    pub tree_sha: String,
-    pub author_name: Option<String>,
-    pub author_email: Option<String>,
-    pub authored_at: Option<String>,
-    pub committer_name: Option<String>,
-    pub committer_email: Option<String>,
-    pub committed_at: Option<String>,
-    pub committed_naive: Option<NaiveDate>,
-    pub message: String,
-    pub parents: Vec<String>,
+fn signature_time(seconds: i64) -> Option<String> {
+    Utc.timestamp_opt(seconds, 0)
+        .single()
+        .map(|t| t.to_rfc3339())
 }
 
 pub fn commit_info(repo: &Repository, oid: Oid) -> Result<CommitInfo> {
@@ -101,80 +170,6 @@ pub fn commit_info(repo: &Repository, oid: Oid) -> Result<CommitInfo> {
         message: commit.message().unwrap_or("").to_string(),
         parents,
     })
-}
-
-fn signature_time(seconds: i64) -> Option<String> {
-    Utc.timestamp_opt(seconds, 0)
-        .single()
-        .map(|t| t.to_rfc3339())
-}
-
-/// One parsed delta from a diff: the event itself plus its hunks (if textual).
-#[derive(Debug, Clone)]
-pub struct DiffFileEvent {
-    pub event_type: FileEventType,
-    pub old_path: Option<String>,
-    pub new_path: Option<String>,
-    pub old_blob_sha: Option<String>,
-    pub new_blob_sha: Option<String>,
-    pub is_binary: bool,
-    pub hunks: Vec<DiffHunkInfo>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiffHunkInfo {
-    pub old_start: u32,
-    pub old_lines: u32,
-    pub new_start: u32,
-    pub new_lines: u32,
-    pub patch_text: String,
-    /// Contiguous added-line ranges on the new side, each `(start, end_inclusive)`.
-    pub added_ranges: Vec<(u32, u32)>,
-}
-
-pub fn collect_diff_events(diff: &Diff<'_>) -> Result<Vec<DiffFileEvent>> {
-    let mut events = Vec::new();
-    for (idx, delta) in diff.deltas().enumerate() {
-        let old_file = delta.old_file();
-        let new_file = delta.new_file();
-
-        let old_path = old_file.path().map(|p| p.to_string_lossy().into_owned());
-        let new_path = new_file.path().map(|p| p.to_string_lossy().into_owned());
-        let old_blob_sha = (!old_file.id().is_zero()).then(|| old_file.id().to_string());
-        let new_blob_sha = (!new_file.id().is_zero()).then(|| new_file.id().to_string());
-
-        let is_binary = old_file.is_binary() || new_file.is_binary();
-        // Binary files override the delta status: we don't blame them, regardless
-        // of whether git also classifies the change as add/modify/rename.
-        let event_type = if is_binary {
-            FileEventType::BinarySkipped
-        } else {
-            map_delta_status(delta.status())
-        };
-
-        let mut event = DiffFileEvent {
-            event_type,
-            old_path,
-            new_path,
-            old_blob_sha,
-            new_blob_sha,
-            is_binary,
-            hunks: Vec::new(),
-        };
-
-        if is_binary {
-            events.push(event);
-            continue;
-        }
-
-        match Patch::from_diff(diff, idx) {
-            Ok(Some(patch)) => extract_hunks(&patch, &mut event.hunks)?,
-            Ok(None) => {}
-            Err(e) => return Err(anyhow!("extracting patch for delta {idx}: {e}")),
-        }
-        events.push(event);
-    }
-    Ok(events)
 }
 
 fn map_delta_status(status: Delta) -> FileEventType {
@@ -221,44 +216,49 @@ fn extract_hunks(patch: &Patch<'_>, out: &mut Vec<DiffHunkInfo>) -> Result<()> {
     Ok(())
 }
 
-/// Builds contiguous `(start, end_inclusive)` ranges from a stream of added
-/// line numbers seen in source order.
-#[derive(Default)]
-struct AddedRangeCollector {
-    ranges: Vec<(u32, u32)>,
-    current: Option<(u32, u32)>,
-}
+pub fn collect_diff_events(diff: &Diff<'_>) -> Result<Vec<DiffFileEvent>> {
+    let mut events = Vec::new();
+    for (idx, delta) in diff.deltas().enumerate() {
+        let old_file = delta.old_file();
+        let new_file = delta.new_file();
 
-impl AddedRangeCollector {
-    fn push(&mut self, line: u32) {
-        match self.current {
-            Some((start, end)) if line == end + 1 => self.current = Some((start, line)),
-            Some(range) => {
-                self.ranges.push(range);
-                self.current = Some((line, line));
-            }
-            None => self.current = Some((line, line)),
+        let old_path = old_file.path().map(|p| p.to_string_lossy().into_owned());
+        let new_path = new_file.path().map(|p| p.to_string_lossy().into_owned());
+        let old_blob_sha = (!old_file.id().is_zero()).then(|| old_file.id().to_string());
+        let new_blob_sha = (!new_file.id().is_zero()).then(|| new_file.id().to_string());
+
+        let is_binary = old_file.is_binary() || new_file.is_binary();
+        // Binary files override the delta status: we don't blame them, regardless
+        // of whether git also classifies the change as add/modify/rename.
+        let event_type = if is_binary {
+            FileEventType::BinarySkipped
+        } else {
+            map_delta_status(delta.status())
+        };
+
+        let mut event = DiffFileEvent {
+            event_type,
+            old_path,
+            new_path,
+            old_blob_sha,
+            new_blob_sha,
+            is_binary,
+            hunks: Vec::new(),
+        };
+
+        if is_binary {
+            events.push(event);
+            continue;
         }
-    }
 
-    fn finish(mut self) -> Vec<(u32, u32)> {
-        if let Some(range) = self.current.take() {
-            self.ranges.push(range);
+        match Patch::from_diff(diff, idx) {
+            Ok(Some(patch)) => extract_hunks(&patch, &mut event.hunks)?,
+            Ok(None) => {}
+            Err(e) => return Err(anyhow!("extracting patch for delta {idx}: {e}")),
         }
-        self.ranges
+        events.push(event);
     }
-}
-
-/// One row from a clipped blame run: a contiguous span on the requested side
-/// attributed to a single ancestor commit.
-#[derive(Debug, Clone)]
-pub struct BlameSpan {
-    pub blamed_commit_sha: String,
-    pub final_start_line: u32,
-    pub line_count: u32,
-    pub origin_path: Option<String>,
-    pub origin_start_line: Option<u32>,
-    pub boundary: bool,
+    Ok(events)
 }
 
 pub fn run_blame(
