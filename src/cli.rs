@@ -9,10 +9,6 @@ use std::path::PathBuf;
     about = "Recursively trace history behind changed lines on the current branch."
 )]
 pub struct Cli {
-    /// Verbose logging (debug level).
-    #[arg(long, global = true)]
-    pub verbose: bool,
-
     #[command(subcommand)]
     pub command: Command,
 }
