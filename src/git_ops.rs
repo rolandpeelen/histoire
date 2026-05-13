@@ -77,7 +77,7 @@ pub struct DiffFileEvent {
 /// One row from a clipped blame run: a contiguous span on the requested side
 /// attributed to a single ancestor commit.
 #[derive(Debug, Clone)]
-pub struct BlameSpan {
+pub struct BlameHunk {
     pub blamed_commit_sha: String,
     pub final_start_line: u32,
     pub line_count: u32,
@@ -267,7 +267,7 @@ pub fn run_blame(
     path: &str,
     start_line: u32,
     end_line: u32,
-) -> Result<Vec<BlameSpan>> {
+) -> Result<Vec<BlameHunk>> {
     let mut opts = BlameOptions::new();
     opts.newest_commit(commit_oid);
     opts.track_copies_same_file(true);
@@ -296,7 +296,7 @@ pub fn run_blame(
         let offset = clip_start - final_start;
 
         let orig_start = hunk.orig_start_line() as u32;
-        spans.push(BlameSpan {
+        spans.push(BlameHunk {
             blamed_commit_sha: hunk.final_commit_id().to_string(),
             final_start_line: clip_start,
             line_count: clip_lines,

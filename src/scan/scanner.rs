@@ -10,7 +10,7 @@ use crate::db::{
     InsertFileEvent, InsertLineageEdge, LineageEdgeType, UpsertCommit,
 };
 use crate::git_ops::{
-    BlameSpan, CommitInfo, collect_diff_events, commit_info, compute_diff, run_blame,
+    BlameHunk, CommitInfo, collect_diff_events, commit_info, compute_diff, run_blame,
 };
 
 use super::plan::{classify_terminal, effective_event_type, plan_parent_recursion};
@@ -215,7 +215,7 @@ impl Scanner<'_> {
     fn write_terminal_for_all(
         &mut self,
         req: &db::BlameRequest,
-        spans: &[(i64, BlameSpan)],
+        spans: &[(i64, BlameHunk)],
         edge_type: LineageEdgeType,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
@@ -241,7 +241,7 @@ impl Scanner<'_> {
         &mut self,
         req: &db::BlameRequest,
         info: &CommitInfo,
-        spans: &[(i64, BlameSpan)],
+        spans: &[(i64, BlameHunk)],
     ) -> Result<()> {
         let blamed_oid = Oid::from_str(&info.sha)?;
         for (idx, parent_sha) in info.parents.iter().enumerate() {
@@ -271,7 +271,7 @@ impl Scanner<'_> {
         &mut self,
         req: &db::BlameRequest,
         info: &CommitInfo,
-        spans: Vec<(i64, BlameSpan)>,
+        spans: Vec<(i64, BlameHunk)>,
     ) -> Result<()> {
         match classify_terminal(req, info, self.max_depth, self.since) {
             Some(edge_type) => self.write_terminal_for_all(req, &spans, edge_type),
@@ -284,9 +284,9 @@ impl Scanner<'_> {
     fn persist_blame_spans(
         &mut self,
         req: &db::BlameRequest,
-        spans: Vec<BlameSpan>,
-    ) -> Result<HashMap<String, Vec<(i64, BlameSpan)>>> {
-        let mut by_commit: HashMap<String, Vec<(i64, BlameSpan)>> = HashMap::new();
+        spans: Vec<BlameHunk>,
+    ) -> Result<HashMap<String, Vec<(i64, BlameHunk)>>> {
+        let mut by_commit: HashMap<String, Vec<(i64, BlameHunk)>> = HashMap::new();
         let tx = self.conn.transaction()?;
         for span in spans {
             let span_id = db::insert_blame_span(

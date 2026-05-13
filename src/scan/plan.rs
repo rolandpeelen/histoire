@@ -1,7 +1,7 @@
 use chrono::NaiveDate;
 
 use crate::db::{self, FileEventType, LineageEdgeType};
-use crate::git_ops::{BlameSpan, CommitInfo, DiffFileEvent};
+use crate::git_ops::{BlameHunk, CommitInfo, DiffFileEvent};
 
 use super::{PersistedDiff, RecurseAction};
 
@@ -14,7 +14,7 @@ fn parent_side_path(event: &DiffFileEvent) -> Option<String> {
 
 fn plan_for_span(
     span_id: i64,
-    span: &BlameSpan,
+    span: &BlameHunk,
     cached: &PersistedDiff,
     actions: &mut Vec<RecurseAction>,
 ) {
@@ -95,7 +95,7 @@ fn plan_for_span(
 
 /// Pure: for one parent's persisted diff, decide what each span should do.
 pub(super) fn plan_parent_recursion(
-    spans: &[(i64, BlameSpan)],
+    spans: &[(i64, BlameHunk)],
     cached: &PersistedDiff,
 ) -> Vec<RecurseAction> {
     let mut actions = Vec::new();
