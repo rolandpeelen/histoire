@@ -5,9 +5,10 @@
 //! 1. [`run`] does a pure, in-memory blame traversal of every added range from
 //!    merge-base→HEAD. It returns the full traversal as rows in a [`ScanResult`].
 //!    No database writes happen here.
-//! 2. The caller writes the [`ScanResult`] to SQLite via [`crate::db::save`].
+//! 2. The caller writes the [`ScanResult`] to SQLite via [`ScanResult::save`].
 
 use anyhow::{Result, anyhow};
+use rusqlite::Connection;
 use tracing::{info, warn};
 
 use crate::cli::{ScanArgs, default_since};
@@ -44,6 +45,39 @@ pub struct ScanSummary {
 }
 
 impl ScanResult {
+    /// Persist every row in this scan to `conn` in a single transaction.
+    pub fn save(&self, conn: &mut Connection) -> Result<()> {
+        let transaction = conn.transaction()?;
+        self.repository.insert(&transaction)?;
+        self.scan.insert(&transaction)?;
+        self.commits
+            .iter()
+            .try_for_each(|row| row.upsert(&transaction))?;
+        self.commit_parents
+            .iter()
+            .try_for_each(|row| row.upsert(&transaction))?;
+        self.file_events
+            .iter()
+            .try_for_each(|row| row.insert(&transaction))?;
+        self.diff_hunks
+            .iter()
+            .try_for_each(|row| row.insert(&transaction))?;
+        self.seed_ranges
+            .iter()
+            .try_for_each(|row| row.insert(&transaction))?;
+        self.blame_requests
+            .iter()
+            .try_for_each(|row| row.insert(&transaction))?;
+        self.blame_spans
+            .iter()
+            .try_for_each(|row| row.insert(&transaction))?;
+        self.lineage_edges
+            .iter()
+            .try_for_each(|row| row.insert(&transaction))?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn summary(&self) -> ScanSummary {
         let seed_files = self
             .seed_ranges
@@ -102,7 +136,7 @@ pub fn run(cli: &ScanArgs) -> Result<ScanResult> {
     let remote_url = repo
         .find_remote("origin")
         .ok()
-        .and_then(|r| r.url().map(String::from));
+        .and_then(|remote| remote.url().map(String::from));
 
     let head = head_commit(&repo)?;
     let head_id = head.id();
@@ -111,10 +145,10 @@ pub fn run(cli: &ScanArgs) -> Result<ScanResult> {
 
     let base_commit = match resolve_ref(&repo, &cli.base_ref) {
         Ok(commit) => Some(commit),
-        Err(e) => {
+        Err(error) => {
             warn!(
                 "base ref '{}' not found ({}); recording empty scan",
-                cli.base_ref, e
+                cli.base_ref, error
             );
             None
         }
@@ -148,7 +182,7 @@ pub fn run(cli: &ScanArgs) -> Result<ScanResult> {
         since_date: since.to_string(),
     };
 
-    let mut scanner = Scanner::new(
+    Scanner::new(
         &repo,
         repository,
         scan,
@@ -156,8 +190,8 @@ pub fn run(cli: &ScanArgs) -> Result<ScanResult> {
         cli.max_depth,
         cli.rename_threshold,
         cli.include_binary,
-    );
-    scanner.seed(merge_base_id, head_id)?;
-    scanner.drain_queue()?;
-    Ok(scanner.into_result())
+        merge_base_id,
+        head_id,
+    )?
+    .run()
 }

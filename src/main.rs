@@ -20,7 +20,7 @@ fn run_scan(args: &cli::ScanArgs) -> Result<()> {
     info!("database: {}", db_path.display());
 
     let mut conn = db::open_fresh(&db_path)?;
-    db::save(&mut conn, &result)?;
+    result.save(&mut conn)?;
 
     let summary = result.summary();
     info!(

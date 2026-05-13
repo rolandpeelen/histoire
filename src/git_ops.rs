@@ -62,6 +62,42 @@ pub struct DiffHunkInfo {
     pub added_ranges: Vec<(u32, u32)>,
 }
 
+impl DiffHunkInfo {
+    fn from_patch(patch: &Patch<'_>) -> Result<Vec<DiffHunkInfo>> {
+        let mut hunks = Vec::with_capacity(patch.num_hunks());
+        for hunk_index in 0..patch.num_hunks() {
+            let (hunk, _line_count) = patch.hunk(hunk_index)?;
+            let header = std::str::from_utf8(hunk.header()).unwrap_or("").to_string();
+            let mut text = header;
+            let mut added = AddedRangeCollector::default();
+
+            let lines_in_hunk = patch.num_lines_in_hunk(hunk_index)?;
+            for line_index in 0..lines_in_hunk {
+                let line = patch.line_in_hunk(hunk_index, line_index)?;
+                text.push(line.origin());
+                if let Ok(content) = std::str::from_utf8(line.content()) {
+                    text.push_str(content);
+                }
+                if line.origin() == '+'
+                    && let Some(line_number) = line.new_lineno()
+                {
+                    added.push(line_number);
+                }
+            }
+
+            hunks.push(DiffHunkInfo {
+                old_start: hunk.old_start(),
+                old_lines: hunk.old_lines(),
+                new_start: hunk.new_start(),
+                new_lines: hunk.new_lines(),
+                patch_text: text,
+                added_ranges: added.finish(),
+            });
+        }
+        Ok(hunks)
+    }
+}
+
 /// One parsed delta from a diff: the event itself plus its hunks (if textual).
 #[derive(Debug, Clone)]
 pub struct DiffFileEvent {
@@ -102,9 +138,9 @@ pub fn head_commit(repo: &Repository) -> Result<Commit<'_>> {
     Ok(head.peel_to_commit()?)
 }
 
-pub fn merge_base(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
-    repo.merge_base(a, b)
-        .with_context(|| format!("computing merge-base({a}, {b})"))
+pub fn merge_base(repo: &Repository, lhs: Oid, rhs: Oid) -> Result<Oid> {
+    repo.merge_base(lhs, rhs)
+        .with_context(|| format!("computing merge-base({lhs}, {rhs})"))
 }
 
 /// Compute a tree-to-tree diff with aggressive rename/copy detection.
@@ -118,7 +154,7 @@ pub fn compute_diff<'repo>(
 ) -> Result<Diff<'repo>> {
     let new_tree = repo.find_commit(new_oid)?.tree()?;
     let old_tree = match old_oid {
-        Some(o) => Some(repo.find_commit(o)?.tree()?),
+        Some(oid) => Some(repo.find_commit(oid)?.tree()?),
         None => None,
     };
 
@@ -142,7 +178,7 @@ pub fn compute_diff<'repo>(
 fn signature_time(seconds: i64) -> Option<String> {
     Utc.timestamp_opt(seconds, 0)
         .single()
-        .map(|t| t.to_rfc3339())
+        .map(|time| time.to_rfc3339())
 }
 
 pub fn commit_info(repo: &Repository, oid: Oid) -> Result<CommitInfo> {
@@ -151,20 +187,20 @@ pub fn commit_info(repo: &Repository, oid: Oid) -> Result<CommitInfo> {
     let committer = commit.committer();
     let authored_at = signature_time(author.when().seconds());
     let committed_at = signature_time(committer.when().seconds());
-    let committed_naive = committed_at.as_ref().and_then(|s| {
-        DateTime::parse_from_rfc3339(s)
+    let committed_naive = committed_at.as_ref().and_then(|timestamp| {
+        DateTime::parse_from_rfc3339(timestamp)
             .ok()
-            .map(|d| d.with_timezone(&Utc).date_naive())
+            .map(|datetime| datetime.with_timezone(&Utc).date_naive())
     });
     let parents: Vec<String> = commit.parent_ids().map(|id| id.to_string()).collect();
     Ok(CommitInfo {
         sha: oid.to_string(),
         tree_sha: commit.tree_id().to_string(),
-        author_name: author.name().map(|s| s.to_string()),
-        author_email: author.email().map(|s| s.to_string()),
+        author_name: author.name().map(|name| name.to_string()),
+        author_email: author.email().map(|email| email.to_string()),
         authored_at,
-        committer_name: committer.name().map(|s| s.to_string()),
-        committer_email: committer.email().map(|s| s.to_string()),
+        committer_name: committer.name().map(|name| name.to_string()),
+        committer_email: committer.email().map(|email| email.to_string()),
         committed_at,
         committed_naive,
         message: commit.message().unwrap_or("").to_string(),
@@ -183,47 +219,18 @@ fn map_delta_status(status: Delta) -> FileEventType {
     }
 }
 
-fn extract_hunks(patch: &Patch<'_>, out: &mut Vec<DiffHunkInfo>) -> Result<()> {
-    for hunk_idx in 0..patch.num_hunks() {
-        let (hunk, _line_count) = patch.hunk(hunk_idx)?;
-        let header = std::str::from_utf8(hunk.header()).unwrap_or("").to_string();
-        let mut text = header;
-        let mut added = AddedRangeCollector::default();
-
-        let lines_in_hunk = patch.num_lines_in_hunk(hunk_idx)?;
-        for line_idx in 0..lines_in_hunk {
-            let line = patch.line_in_hunk(hunk_idx, line_idx)?;
-            text.push(line.origin());
-            if let Ok(content) = std::str::from_utf8(line.content()) {
-                text.push_str(content);
-            }
-            if line.origin() == '+'
-                && let Some(ln) = line.new_lineno()
-            {
-                added.push(ln);
-            }
-        }
-
-        out.push(DiffHunkInfo {
-            old_start: hunk.old_start(),
-            old_lines: hunk.old_lines(),
-            new_start: hunk.new_start(),
-            new_lines: hunk.new_lines(),
-            patch_text: text,
-            added_ranges: added.finish(),
-        });
-    }
-    Ok(())
-}
-
 pub fn collect_diff_events(diff: &Diff<'_>) -> Result<Vec<DiffFileEvent>> {
     let mut events = Vec::new();
-    for (idx, delta) in diff.deltas().enumerate() {
+    for (delta_index, delta) in diff.deltas().enumerate() {
         let old_file = delta.old_file();
         let new_file = delta.new_file();
 
-        let old_path = old_file.path().map(|p| p.to_string_lossy().into_owned());
-        let new_path = new_file.path().map(|p| p.to_string_lossy().into_owned());
+        let old_path = old_file
+            .path()
+            .map(|path| path.to_string_lossy().into_owned());
+        let new_path = new_file
+            .path()
+            .map(|path| path.to_string_lossy().into_owned());
         let old_blob_sha = (!old_file.id().is_zero()).then(|| old_file.id().to_string());
         let new_blob_sha = (!new_file.id().is_zero()).then(|| new_file.id().to_string());
 
@@ -251,10 +258,12 @@ pub fn collect_diff_events(diff: &Diff<'_>) -> Result<Vec<DiffFileEvent>> {
             continue;
         }
 
-        match Patch::from_diff(diff, idx) {
-            Ok(Some(patch)) => extract_hunks(&patch, &mut event.hunks)?,
+        match Patch::from_diff(diff, delta_index) {
+            Ok(Some(patch)) => event.hunks = DiffHunkInfo::from_patch(&patch)?,
             Ok(None) => {}
-            Err(e) => return Err(anyhow!("extracting patch for delta {idx}: {e}")),
+            Err(error) => {
+                return Err(anyhow!("extracting patch for delta {delta_index}: {error}"));
+            }
         }
         events.push(event);
     }
@@ -300,7 +309,7 @@ pub fn run_blame(
             blamed_commit_sha: hunk.final_commit_id().to_string(),
             final_start_line: clip_start,
             line_count: clip_lines,
-            origin_path: hunk.path().map(|p| p.to_string_lossy().into_owned()),
+            origin_path: hunk.path().map(|path| path.to_string_lossy().into_owned()),
             origin_start_line: Some(orig_start + offset),
             boundary: hunk.is_boundary(),
         });
@@ -314,16 +323,16 @@ mod tests {
 
     #[test]
     fn added_range_collector_groups_contiguous() {
-        let mut c = AddedRangeCollector::default();
-        for ln in [10, 11, 12, 20, 21, 30] {
-            c.push(ln);
+        let mut collector = AddedRangeCollector::default();
+        for line in [10, 11, 12, 20, 21, 30] {
+            collector.push(line);
         }
-        assert_eq!(c.finish(), vec![(10, 12), (20, 21), (30, 30)]);
+        assert_eq!(collector.finish(), vec![(10, 12), (20, 21), (30, 30)]);
     }
 
     #[test]
     fn added_range_collector_handles_empty() {
-        let c = AddedRangeCollector::default();
-        assert_eq!(c.finish(), Vec::<(u32, u32)>::new());
+        let collector = AddedRangeCollector::default();
+        assert_eq!(collector.finish(), Vec::<(u32, u32)>::new());
     }
 }

@@ -66,7 +66,7 @@ impl LineageEdgeType {
 /// Value of the `parent_position` column for `file_events` / `diff_hunks`.
 /// `Seed` is the merge-base→HEAD diff that initiates the scan (NULL on disk);
 /// `Index(n)` is the n-th parent of a commit visited during recursion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ParentPos {
     Seed,
     Index(u32),

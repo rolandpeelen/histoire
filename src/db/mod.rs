@@ -58,49 +58,6 @@ pub fn open_fresh(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Persist a completed scan to the open database in one transaction. Row IDs
-/// in the result are written verbatim, so the caller is responsible for
-/// allocating them densely from 1 (matches SQLite rowid convention).
-pub fn save(conn: &mut Connection, result: &crate::scan::ScanResult) -> Result<()> {
-    let transaction = conn.transaction()?;
-    result.repository.insert(&transaction)?;
-    result.scan.insert(&transaction)?;
-    result
-        .commits
-        .iter()
-        .try_for_each(|row| row.upsert(&transaction))?;
-    result
-        .commit_parents
-        .iter()
-        .try_for_each(|row| row.upsert(&transaction))?;
-    result
-        .file_events
-        .iter()
-        .try_for_each(|row| row.insert(&transaction))?;
-    result
-        .diff_hunks
-        .iter()
-        .try_for_each(|row| row.insert(&transaction))?;
-    result
-        .seed_ranges
-        .iter()
-        .try_for_each(|row| row.insert(&transaction))?;
-    result
-        .blame_requests
-        .iter()
-        .try_for_each(|row| row.insert(&transaction))?;
-    result
-        .blame_spans
-        .iter()
-        .try_for_each(|row| row.insert(&transaction))?;
-    result
-        .lineage_edges
-        .iter()
-        .try_for_each(|row| row.insert(&transaction))?;
-    transaction.commit()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
 use git2::{Oid, Repository};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use tracing::{debug, info};
 
 use crate::db::{
@@ -16,7 +16,7 @@ use super::plan::{classify_terminal, effective_event_type, plan_parent_recursion
 use super::{PersistedDiff, PersistedEvent, RecurseAction, ScanResult};
 
 /// Diff cache key — the (commit, which-parent-slot) pair we already computed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DiffKey {
     commit_sha: String,
     position: ParentPos,
@@ -68,15 +68,18 @@ pub struct Scanner<'a> {
     since: NaiveDate,
     rename_threshold: u16,
     include_binary: bool,
-    commit_cache: HashMap<String, CommitInfo>,
-    diff_cache: HashMap<DiffKey, PersistedDiff>,
-    request_dedup: HashMap<RequestKey, i64>,
-    queue: VecDeque<i64>,
+    commit_cache: BTreeMap<String, CommitInfo>,
+    diff_cache: BTreeMap<DiffKey, PersistedDiff>,
+    request_dedup: BTreeMap<RequestKey, i64>,
+    queue: VecDeque<BlameRequest>,
     next_id: NextIds,
     result: ScanResult,
 }
 
 impl<'a> Scanner<'a> {
+    /// Build a Scanner and seed its work queue with the merge-base→HEAD diff.
+    /// Returns a Scanner ready to be drained via [`Scanner::run`].
+    #[allow(clippy::too_many_arguments)] // mirrors the ScanArgs struct verbatim
     pub fn new(
         repo: &'a Repository,
         repository: DbRepository,
@@ -85,16 +88,18 @@ impl<'a> Scanner<'a> {
         max_depth: u32,
         rename_threshold: u16,
         include_binary: bool,
-    ) -> Self {
-        Self {
+        merge_base_id: Oid,
+        head_id: Oid,
+    ) -> Result<Self> {
+        let mut scanner = Self {
             repo,
             max_depth,
             since,
             rename_threshold,
             include_binary,
-            commit_cache: HashMap::new(),
-            diff_cache: HashMap::new(),
-            request_dedup: HashMap::new(),
+            commit_cache: BTreeMap::new(),
+            diff_cache: BTreeMap::new(),
+            request_dedup: BTreeMap::new(),
             queue: VecDeque::new(),
             next_id: NextIds::new(),
             result: ScanResult {
@@ -109,11 +114,9 @@ impl<'a> Scanner<'a> {
                 blame_spans: Vec::new(),
                 lineage_edges: Vec::new(),
             },
-        }
-    }
-
-    pub fn into_result(self) -> ScanResult {
-        self.result
+        };
+        scanner.seed(merge_base_id, head_id)?;
+        Ok(scanner)
     }
 
     /// Append a `commits` row (and its `commit_parents` rows) for `commit_id`,
@@ -137,12 +140,12 @@ impl<'a> Scanner<'a> {
             committed_at: info.committed_at.clone(),
             message: info.message.clone(),
         });
-        for (idx, parent_sha) in info.parents.iter().enumerate() {
+        for (index, parent_sha) in info.parents.iter().enumerate() {
             self.result.commit_parents.push(CommitParent {
                 repository_id,
                 commit_sha: info.sha.clone(),
                 parent_sha: parent_sha.clone(),
-                parent_position: idx as i64,
+                parent_position: index as i64,
             });
         }
         self.commit_cache.insert(sha, info);
@@ -229,8 +232,7 @@ impl<'a> Scanner<'a> {
         }
         let id = self.next_id.blame_request.alloc();
         self.request_dedup.insert(key, id);
-        self.queue.push_back(id);
-        self.result.blame_requests.push(BlameRequest {
+        let request = BlameRequest {
             id,
             scan_id: self.result.scan.id,
             commit_sha,
@@ -239,7 +241,9 @@ impl<'a> Scanner<'a> {
             end_line,
             depth,
             reason,
-        });
+        };
+        self.queue.push_back(request.clone());
+        self.result.blame_requests.push(request);
         id
     }
 
@@ -267,8 +271,8 @@ impl<'a> Scanner<'a> {
         &mut self,
         request: &BlameRequest,
         hunks: Vec<BlameHunk>,
-    ) -> HashMap<String, Vec<(i64, BlameHunk)>> {
-        let mut by_commit: HashMap<String, Vec<(i64, BlameHunk)>> = HashMap::new();
+    ) -> BTreeMap<String, Vec<(i64, BlameHunk)>> {
+        let mut by_commit: BTreeMap<String, Vec<(i64, BlameHunk)>> = BTreeMap::new();
         let repository_id = self.result.repository.id;
         for hunk in hunks {
             let span_id = self.next_id.blame_span.alloc();
@@ -377,8 +381,8 @@ impl<'a> Scanner<'a> {
         spans: &[(i64, BlameHunk)],
     ) -> Result<()> {
         let blamed_id = Oid::from_str(&info.sha)?;
-        for (idx, parent_sha) in info.parents.iter().enumerate() {
-            let position = ParentPos::Index(idx as u32);
+        for (index, parent_sha) in info.parents.iter().enumerate() {
+            let position = ParentPos::Index(index as u32);
             let parent_id = Oid::from_str(parent_sha)?;
             self.ensure_diff_cached(blamed_id, parent_id, position)?;
 
@@ -400,13 +404,7 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
-    fn process_request(&mut self, request_id: i64) -> Result<()> {
-        let request = self
-            .result
-            .blame_requests
-            .get((request_id - 1) as usize)
-            .ok_or_else(|| anyhow!("blame_request #{request_id} not found"))?
-            .clone();
+    fn process_request(&mut self, request: BlameRequest) -> Result<()> {
         debug!(
             "process request #{} commit={} path={} {}..{} depth={}",
             request.id,
@@ -447,7 +445,7 @@ impl<'a> Scanner<'a> {
             })
     }
 
-    pub fn seed(&mut self, merge_base_id: Oid, head_id: Oid) -> Result<()> {
+    fn seed(&mut self, merge_base_id: Oid, head_id: Oid) -> Result<()> {
         if merge_base_id == head_id {
             info!("merge-base equals HEAD; nothing to seed");
             return Ok(());
@@ -457,42 +455,33 @@ impl<'a> Scanner<'a> {
         let head_sha = head_id.to_string();
         let scan_id = self.result.scan.id;
 
-        persisted
-            .events
-            .iter()
-            .filter_map(|event| event.info.new_path.as_deref().map(|path| (event, path)))
-            .flat_map(|(event, new_path)| {
-                event
-                    .info
-                    .hunks
-                    .iter()
-                    .zip(&event.hunk_ids)
-                    .flat_map(move |(hunk, &hunk_id)| {
-                        hunk.added_ranges
-                            .iter()
-                            .map(move |&(start, end)| (new_path, start, end, hunk_id))
-                    })
-            })
-            .for_each(|(new_path, start, end, hunk_id)| {
-                let seed_range_id = self.next_id.seed_range.alloc();
-                self.result.seed_ranges.push(SeedRange {
-                    id: seed_range_id,
-                    scan_id,
-                    commit_sha: head_sha.clone(),
-                    path: new_path.to_string(),
-                    start_line: i64::from(start),
-                    end_line: i64::from(end),
-                    diff_hunk_id: Some(hunk_id),
-                });
-                self.enqueue_request(
-                    head_sha.clone(),
-                    new_path.to_string(),
-                    i64::from(start),
-                    i64::from(end),
-                    0,
-                    BlameReason::Seed,
-                );
-            });
+        for event in &persisted.events {
+            let Some(new_path) = event.info.new_path.as_deref() else {
+                continue;
+            };
+            for (hunk, &hunk_id) in event.info.hunks.iter().zip(&event.hunk_ids) {
+                for &(start, end) in &hunk.added_ranges {
+                    let seed_range_id = self.next_id.seed_range.alloc();
+                    self.result.seed_ranges.push(SeedRange {
+                        id: seed_range_id,
+                        scan_id,
+                        commit_sha: head_sha.clone(),
+                        path: new_path.to_string(),
+                        start_line: i64::from(start),
+                        end_line: i64::from(end),
+                        diff_hunk_id: Some(hunk_id),
+                    });
+                    self.enqueue_request(
+                        head_sha.clone(),
+                        new_path.to_string(),
+                        i64::from(start),
+                        i64::from(end),
+                        0,
+                        BlameReason::Seed,
+                    );
+                }
+            }
+        }
 
         self.diff_cache.insert(
             DiffKey {
@@ -504,10 +493,11 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
-    pub fn drain_queue(&mut self) -> Result<()> {
-        while let Some(request_id) = self.queue.pop_front() {
-            self.process_request(request_id)?;
+    /// Drain the work queue and return the assembled scan result.
+    pub fn run(mut self) -> Result<ScanResult> {
+        while let Some(request) = self.queue.pop_front() {
+            self.process_request(request)?;
         }
-        Ok(())
+        Ok(self.result)
     }
 }

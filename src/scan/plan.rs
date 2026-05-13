@@ -18,22 +18,21 @@ fn plan_for_span(
     cached: &PersistedDiff,
     actions: &mut Vec<RecurseAction>,
 ) {
-    let (origin_path, origin_start) = match (span.origin_path.as_deref(), span.origin_start_line) {
-        (Some(p), Some(s)) => (p, s),
-        _ => {
-            actions.push(RecurseAction::Terminal {
-                span_id,
-                edge_type: LineageEdgeType::IntroducedHere,
-            });
-            return;
-        }
+    let (Some(origin_path), Some(origin_start)) =
+        (span.origin_path.as_deref(), span.origin_start_line)
+    else {
+        actions.push(RecurseAction::Terminal {
+            span_id,
+            edge_type: LineageEdgeType::IntroducedHere,
+        });
+        return;
     };
     let origin_end_excl = origin_start + span.line_count;
 
     let Some(event) = cached
         .events
         .iter()
-        .find(|e| e.info.new_path.as_deref() == Some(origin_path))
+        .find(|event| event.info.new_path.as_deref() == Some(origin_path))
     else {
         // The path isn't part of this parent's diff (e.g. a merge that pulled
         // the path in from the other side). Nothing to emit for this parent.
@@ -173,8 +172,8 @@ mod tests {
         }
     }
 
-    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).expect("test date is valid")
+    fn ymd(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("test date is valid")
     }
 
     #[test]
