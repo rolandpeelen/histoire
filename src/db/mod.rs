@@ -11,18 +11,13 @@ mod repositories;
 mod scans;
 mod types;
 
-pub use blame::{
-    BlameRequest, InsertBlameRequest, InsertBlameSpan, insert_blame_span,
-    insert_or_get_blame_request, load_request, mark_request_complete, pick_next_request,
-};
-pub use commits::{UpsertCommit, upsert_commit, upsert_commit_parent};
-pub use file_events::{
-    InsertDiffHunk, InsertFileEvent, insert_diff_hunk, insert_file_event, insert_seed_range,
-};
-pub use lineage::{InsertLineageEdge, insert_lineage_edge};
-pub use repositories::ensure_repository;
-pub use scans::{InsertScan, finalize_scan, insert_scan, summarize};
-pub use types::{BlameReason, FileEventType, LineageEdgeType};
+pub use blame::{BlameRequest, BlameSpan};
+pub use commits::{Commit, CommitParent};
+pub use file_events::{DiffHunk, FileEvent, SeedRange};
+pub use lineage::LineageEdge;
+pub use repositories::Repository;
+pub use scans::Scan;
+pub use types::{BlameReason, FileEventType, LineageEdgeType, ParentPos};
 
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
@@ -61,6 +56,49 @@ pub fn open_fresh(path: &Path) -> Result<Connection> {
     )?;
     conn.execute_batch(SCHEMA_SQL)?;
     Ok(conn)
+}
+
+/// Persist a completed scan to the open database in one transaction. Row IDs
+/// in the result are written verbatim, so the caller is responsible for
+/// allocating them densely from 1 (matches SQLite rowid convention).
+pub fn save(conn: &mut Connection, result: &crate::scan::ScanResult) -> Result<()> {
+    let transaction = conn.transaction()?;
+    result.repository.insert(&transaction)?;
+    result.scan.insert(&transaction)?;
+    result
+        .commits
+        .iter()
+        .try_for_each(|row| row.upsert(&transaction))?;
+    result
+        .commit_parents
+        .iter()
+        .try_for_each(|row| row.upsert(&transaction))?;
+    result
+        .file_events
+        .iter()
+        .try_for_each(|row| row.insert(&transaction))?;
+    result
+        .diff_hunks
+        .iter()
+        .try_for_each(|row| row.insert(&transaction))?;
+    result
+        .seed_ranges
+        .iter()
+        .try_for_each(|row| row.insert(&transaction))?;
+    result
+        .blame_requests
+        .iter()
+        .try_for_each(|row| row.insert(&transaction))?;
+    result
+        .blame_spans
+        .iter()
+        .try_for_each(|row| row.insert(&transaction))?;
+    result
+        .lineage_edges
+        .iter()
+        .try_for_each(|row| row.insert(&transaction))?;
+    transaction.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]

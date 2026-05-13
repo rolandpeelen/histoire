@@ -1,6 +1,6 @@
 use chrono::NaiveDate;
 
-use crate::db::{self, FileEventType, LineageEdgeType};
+use crate::db::{BlameRequest, FileEventType, LineageEdgeType};
 use crate::git_ops::{BlameHunk, CommitInfo, DiffFileEvent};
 
 use super::{PersistedDiff, RecurseAction};
@@ -108,7 +108,7 @@ pub(super) fn plan_parent_recursion(
 /// Pure check: does this blamed commit hit a recursion cutoff? Returns the
 /// terminal edge type if so, or `None` if recursion should proceed.
 pub(super) fn classify_terminal(
-    req: &db::BlameRequest,
+    request: &BlameRequest,
     info: &CommitInfo,
     max_depth: u32,
     since: NaiveDate,
@@ -116,12 +116,12 @@ pub(super) fn classify_terminal(
     if info.parents.is_empty() {
         return Some(LineageEdgeType::RootCommit);
     }
-    if let Some(d) = info.committed_naive
-        && d < since
+    if let Some(committed) = info.committed_naive
+        && committed < since
     {
         return Some(LineageEdgeType::OlderThanSince);
     }
-    if req.depth >= max_depth {
+    if request.depth >= max_depth {
         return Some(LineageEdgeType::MaxDepth);
     }
     None
@@ -144,14 +144,16 @@ pub(super) fn effective_event_type(event: &DiffFileEvent, include_binary: bool) 
 mod tests {
     use super::*;
 
-    fn dummy_req(depth: u32) -> db::BlameRequest {
-        db::BlameRequest {
+    fn dummy_request(depth: u32) -> BlameRequest {
+        BlameRequest {
             id: 0,
+            scan_id: 1,
             commit_sha: "x".into(),
             path: "p".into(),
             start_line: 1,
             end_line: 1,
             depth,
+            reason: crate::db::BlameReason::Seed,
         }
     }
 
@@ -178,28 +180,28 @@ mod tests {
     #[test]
     fn classify_terminal_flags_root_commit() {
         let info = dummy_info(vec![], None);
-        let out = classify_terminal(&dummy_req(0), &info, 5, ymd(2020, 1, 1));
+        let out = classify_terminal(&dummy_request(0), &info, 5, ymd(2020, 1, 1));
         assert_eq!(out, Some(LineageEdgeType::RootCommit));
     }
 
     #[test]
     fn classify_terminal_flags_older_than_since() {
         let info = dummy_info(vec!["p".into()], Some(ymd(2020, 1, 1)));
-        let out = classify_terminal(&dummy_req(0), &info, 5, ymd(2024, 1, 1));
+        let out = classify_terminal(&dummy_request(0), &info, 5, ymd(2024, 1, 1));
         assert_eq!(out, Some(LineageEdgeType::OlderThanSince));
     }
 
     #[test]
     fn classify_terminal_flags_max_depth() {
         let info = dummy_info(vec!["p".into()], Some(ymd(2030, 1, 1)));
-        let out = classify_terminal(&dummy_req(5), &info, 5, ymd(2020, 1, 1));
+        let out = classify_terminal(&dummy_request(5), &info, 5, ymd(2020, 1, 1));
         assert_eq!(out, Some(LineageEdgeType::MaxDepth));
     }
 
     #[test]
     fn classify_terminal_allows_recursion() {
         let info = dummy_info(vec!["p".into()], Some(ymd(2030, 1, 1)));
-        let out = classify_terminal(&dummy_req(0), &info, 5, ymd(2020, 1, 1));
+        let out = classify_terminal(&dummy_request(0), &info, 5, ymd(2020, 1, 1));
         assert!(out.is_none());
     }
 }
