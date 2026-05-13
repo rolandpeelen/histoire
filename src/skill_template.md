@@ -1,15 +1,21 @@
 ---
 name: histoire
-description: Use the SQLite database produced by `histoire scan` to recover historical context for the lines changed on the current branch — who wrote them, what they replaced, and why.
+description: Use the SQLite database produced by `histoire scan` or `histoire trace` to recover historical context — who wrote the lines changed on a branch, or the full lineage behind a specific file:line target.
 ---
 
 # histoire
 
-`histoire` is a CLI that runs recursive `git blame` against the diff between `HEAD` and a base ref (default `origin/main`) and writes the resulting lineage graph to a SQLite database. Use this skill when reviewing a PR, explaining a change, or generating code that should respect the prior history of the affected lines.
+`histoire` is a CLI that runs recursive `git blame` and writes the resulting lineage graph to a SQLite database. It has two seed modes:
+
+- **`scan`** — seed from the diff between `HEAD` and a base ref (default `origin/main`). Use when reviewing a PR or branch.
+- **`trace`** — seed from a single `path:line(-end)` target at `HEAD`. Use when investigating one specific region of code.
+
+Both modes share the same recursion machinery and the same database schema.
 
 ## Use this skill when
 
-- The user asks you to review the changes on the current branch and you want to know what the new code replaced.
+- The user asks you to review the changes on the current branch and you want to know what the new code replaced (`scan`).
+- The user points at a specific file and line and asks how it got that way (`trace path:line`).
 - The user asks who last touched a line, what the previous version looked like, or why a function evolved a certain way.
 - You are generating code in a region with non-trivial history and want to avoid undoing earlier intent (e.g. a fix, a workaround, a deliberate API choice).
 
@@ -18,6 +24,7 @@ description: Use the SQLite database produced by `histoire scan` to recover hist
 `histoire` must run inside a Git working tree.
 
 ```sh
+# scan — seed from the merge_base..HEAD diff.
 # Defaults: base = origin/main, db = <git-dir>/histoire.sqlite, depth = 5, since = six months ago.
 histoire scan
 
@@ -26,11 +33,17 @@ histoire scan origin/master
 
 # Tune depth, since, rename threshold:
 histoire scan origin/main --max-depth 8 --since 2024-01-01 --rename-threshold 40
+
+# trace — seed from one path:line target at HEAD.
+# Defaults: depth = 20, since = twelve months ago.
+histoire trace src/main.rs:300
+histoire trace src/main.rs:300-320          # line range
+histoire trace src/main.rs:300 --max-depth 40 --since 2023-01-01
 ```
 
-Each run drops and recreates the database, so it always reflects the current branch state. Run `histoire scan` before you query if the branch has changed.
+Each run drops and recreates the database, so it always reflects the most recent invocation. Re-run `histoire scan` / `histoire trace` before you query if anything has changed.
 
-If the base ref does not exist (e.g. you ran the default `origin/main` on a `master`-only repo), `histoire` warns and writes an empty scan rather than failing. Re-run with the correct base ref.
+If `scan`'s base ref does not exist (e.g. you ran the default `origin/main` on a `master`-only repo), `histoire` warns and writes an empty scan rather than failing. Re-run with the correct base ref.
 
 ## Where the database lives
 
@@ -45,8 +58,11 @@ sqlite3 .git/histoire.sqlite "SELECT * FROM scans;"
 
 ## Conceptual model
 
-- A **scan** records one run: base ref, base SHA, merge base, HEAD, max depth, since-date.
-- The **seed** is the set of added line-ranges in the diff `merge_base..HEAD`. Each seed becomes a depth-0 `blame_requests` row.
+- A **scan** records one run: base ref, base SHA, merge base, HEAD, max depth, since-date. (For `trace` runs the `base_ref` column is set to `trace:<path>:<start>-<end>` and the base/merge-base SHAs both equal HEAD.)
+- The **seed** is the set of starting line-ranges:
+  - `scan` mode: every added line-range in the `merge_base..HEAD` diff.
+  - `trace` mode: a single range from the `path:line(-end)` target.
+- Each seed becomes a depth-0 `blame_requests` row.
 - Processing a request runs `git blame` clipped to its range and produces one or more `blame_spans`, each attributed to a single ancestor `blamed_commit_sha`.
 - For each span, `histoire` either terminates (`root_commit`, `older_than_since`, `max_depth`, `introduced_here`, `binary_skipped`) or creates a depth-N+1 request against each parent of the blamed commit. The relationship is recorded in `lineage_edges`.
 - `file_events` and `diff_hunks` record every delta discovered while walking, including **rename** and **copy** events detected with aggressive similarity matching (default threshold 50; tune with `--rename-threshold`).
@@ -176,3 +192,4 @@ ORDER BY c.committed_at DESC;
 - Merge commits produce multiple edges per span (one per parent). Disambiguate with `parent_position`.
 - The most useful join for "show me everything about a changed file" is `seed_ranges → blame_requests → blame_spans → lineage_edges → commits`.
 - If a scan looks empty or stale (e.g. `seed_ranges` count is 0 but the branch obviously has changes), the base ref probably did not resolve. Re-run with the correct one: `histoire scan origin/<branch>`.
+- To tell a `scan` database apart from a `trace` database, look at `scans.base_ref` — `trace` runs prefix it with `trace:` and set `base_sha = merge_base_sha = head_sha`.

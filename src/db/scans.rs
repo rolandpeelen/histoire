@@ -1,7 +1,9 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-pub struct Scan {
+/// One row in the `scans` table: the metadata that identifies a single scan.
+/// The full in-memory aggregate (this plus every dependent row) is `db::Scan`.
+pub struct ScanRow {
     pub id: i64,
     pub repository_id: i64,
     pub base_ref: String,
@@ -12,9 +14,8 @@ pub struct Scan {
     pub since_date: String,
 }
 
-impl Scan {
+impl ScanRow {
     pub fn insert(&self, conn: &Connection) -> Result<()> {
-        // Saved after the scan finishes, so we write the terminal status directly.
         conn.execute(
             "insert into scans (
                 id, repository_id, base_ref, base_sha, merge_base_sha, head_sha,

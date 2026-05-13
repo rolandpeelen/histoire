@@ -8,6 +8,7 @@ mod commits;
 mod file_events;
 mod lineage;
 mod repositories;
+mod scan;
 mod scans;
 mod types;
 
@@ -16,7 +17,8 @@ pub use commits::{Commit, CommitParent};
 pub use file_events::{DiffHunk, FileEvent, SeedRange};
 pub use lineage::LineageEdge;
 pub use repositories::Repository;
-pub use scans::Scan;
+pub use scan::Scan;
+pub use scans::ScanRow;
 pub use types::{BlameReason, FileEventType, LineageEdgeType, ParentPos};
 
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");

@@ -6,23 +6,21 @@ mod skill;
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-fn run_scan(args: &cli::ScanArgs) -> Result<()> {
-    let result = scan::run(args)?;
-
-    let db_path = args
-        .db
-        .clone()
-        .unwrap_or_else(|| Path::new(&result.repository.git_dir_path).join("histoire.sqlite"));
+fn persist_and_report(scan: &db::Scan, db_override: Option<&Path>) -> Result<()> {
+    let db_path: PathBuf = match db_override {
+        Some(path) => path.to_path_buf(),
+        None => Path::new(&scan.repository.git_dir_path).join("histoire.sqlite"),
+    };
     info!("database: {}", db_path.display());
 
     let mut conn = db::open_fresh(&db_path)?;
-    result.save(&mut conn)?;
+    scan.save(&mut conn)?;
 
-    let summary = result.summary();
+    let summary = scan::summary(scan);
     info!(
         "scan complete: seed_files={}, seed_ranges={}, requests_processed={}, commits_discovered={}, terminal_spans={}",
         summary.seed_files,
@@ -32,6 +30,16 @@ fn run_scan(args: &cli::ScanArgs) -> Result<()> {
         summary.terminal_spans
     );
     Ok(())
+}
+
+fn run_scan(args: &cli::ScanArgs) -> Result<()> {
+    let scan = scan::run_scan(args)?;
+    persist_and_report(&scan, args.db.as_deref())
+}
+
+fn run_trace(args: &cli::TraceArgs) -> Result<()> {
+    let scan = scan::run_trace(args)?;
+    persist_and_report(&scan, args.db.as_deref())
 }
 
 fn main() -> Result<()> {
@@ -47,6 +55,7 @@ fn main() -> Result<()> {
 
     match parsed.command {
         cli::Command::Scan(args) => run_scan(&args),
+        cli::Command::Trace(args) => run_trace(&args),
         cli::Command::Skill(args) => skill::run(&args),
     }
 }

@@ -6,14 +6,31 @@ use tracing::{debug, info};
 
 use crate::db::{
     BlameReason, BlameRequest, BlameSpan, Commit, CommitParent, DiffHunk, FileEvent, FileEventType,
-    LineageEdge, LineageEdgeType, ParentPos, Repository as DbRepository, Scan, SeedRange,
+    LineageEdge, LineageEdgeType, ParentPos, Repository as DbRepository, Scan as DbScan, ScanRow,
+    SeedRange,
 };
 use crate::git_ops::{
     BlameHunk, CommitInfo, collect_diff_events, commit_info, compute_diff, run_blame,
 };
 
 use super::plan::{classify_terminal, effective_event_type, plan_parent_recursion};
-use super::{PersistedDiff, PersistedEvent, RecurseAction, ScanResult};
+use super::{PersistedDiff, PersistedEvent, RecurseAction};
+
+/// How the work queue gets primed. Branch mode seeds from every added line in
+/// the `merge_base..HEAD` diff; line mode seeds from a single `path:line(-end)`
+/// target at HEAD.
+pub enum SeedSpec {
+    Branch {
+        merge_base_id: Oid,
+        head_id: Oid,
+    },
+    Line {
+        head_id: Oid,
+        path: String,
+        start_line: u32,
+        end_line: u32,
+    },
+}
 
 /// Diff cache key — the (commit, which-parent-slot) pair we already computed.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -73,23 +90,22 @@ pub struct Scanner<'a> {
     request_dedup: BTreeMap<RequestKey, i64>,
     queue: VecDeque<BlameRequest>,
     next_id: NextIds,
-    result: ScanResult,
+    scan: DbScan,
 }
 
 impl<'a> Scanner<'a> {
-    /// Build a Scanner and seed its work queue with the merge-base→HEAD diff.
-    /// Returns a Scanner ready to be drained via [`Scanner::run`].
-    #[allow(clippy::too_many_arguments)] // mirrors the ScanArgs struct verbatim
+    /// Build a Scanner and prime its work queue from `seed`. Returns a Scanner
+    /// ready to be drained via [`Scanner::run`].
+    #[allow(clippy::too_many_arguments)] // mirrors the *Args struct knobs
     pub fn new(
         repo: &'a Repository,
         repository: DbRepository,
-        scan: Scan,
+        row: ScanRow,
         since: NaiveDate,
         max_depth: u32,
         rename_threshold: u16,
         include_binary: bool,
-        merge_base_id: Oid,
-        head_id: Oid,
+        seed: SeedSpec,
     ) -> Result<Self> {
         let mut scanner = Self {
             repo,
@@ -102,9 +118,9 @@ impl<'a> Scanner<'a> {
             request_dedup: BTreeMap::new(),
             queue: VecDeque::new(),
             next_id: NextIds::new(),
-            result: ScanResult {
+            scan: DbScan {
                 repository,
-                scan,
+                row,
                 commits: Vec::new(),
                 commit_parents: Vec::new(),
                 file_events: Vec::new(),
@@ -115,7 +131,18 @@ impl<'a> Scanner<'a> {
                 lineage_edges: Vec::new(),
             },
         };
-        scanner.seed(merge_base_id, head_id)?;
+        match seed {
+            SeedSpec::Branch {
+                merge_base_id,
+                head_id,
+            } => scanner.seed_branch(merge_base_id, head_id)?,
+            SeedSpec::Line {
+                head_id,
+                path,
+                start_line,
+                end_line,
+            } => scanner.seed_line(head_id, path, start_line, end_line)?,
+        }
         Ok(scanner)
     }
 
@@ -127,8 +154,8 @@ impl<'a> Scanner<'a> {
             return Ok(());
         }
         let info = commit_info(self.repo, commit_id)?;
-        let repository_id = self.result.repository.id;
-        self.result.commits.push(Commit {
+        let repository_id = self.scan.repository.id;
+        self.scan.commits.push(Commit {
             repository_id,
             sha: info.sha.clone(),
             tree_sha: Some(info.tree_sha.clone()),
@@ -141,7 +168,7 @@ impl<'a> Scanner<'a> {
             message: info.message.clone(),
         });
         for (index, parent_sha) in info.parents.iter().enumerate() {
-            self.result.commit_parents.push(CommitParent {
+            self.scan.commit_parents.push(CommitParent {
                 repository_id,
                 commit_sha: info.sha.clone(),
                 parent_sha: parent_sha.clone(),
@@ -164,13 +191,13 @@ impl<'a> Scanner<'a> {
         let events = collect_diff_events(&diff)?;
         let commit_sha = commit_id.to_string();
         let parent_sha = parent_id.to_string();
-        let repository_id = self.result.repository.id;
+        let repository_id = self.scan.repository.id;
 
         let mut persisted_events = Vec::with_capacity(events.len());
         for event in events {
             let event_type = effective_event_type(&event, self.include_binary);
             let file_event_id = self.next_id.file_event.alloc();
-            self.result.file_events.push(FileEvent {
+            self.scan.file_events.push(FileEvent {
                 id: file_event_id,
                 repository_id,
                 commit_sha: commit_sha.clone(),
@@ -187,7 +214,7 @@ impl<'a> Scanner<'a> {
             if event_type != FileEventType::BinarySkipped {
                 for hunk in &event.hunks {
                     let diff_hunk_id = self.next_id.diff_hunk.alloc();
-                    self.result.diff_hunks.push(DiffHunk {
+                    self.scan.diff_hunks.push(DiffHunk {
                         id: diff_hunk_id,
                         repository_id,
                         file_event_id,
@@ -234,7 +261,7 @@ impl<'a> Scanner<'a> {
         self.request_dedup.insert(key, id);
         let request = BlameRequest {
             id,
-            scan_id: self.result.scan.id,
+            scan_id: self.scan.row.id,
             commit_sha,
             path,
             start_line,
@@ -243,7 +270,7 @@ impl<'a> Scanner<'a> {
             reason,
         };
         self.queue.push_back(request.clone());
-        self.result.blame_requests.push(request);
+        self.scan.blame_requests.push(request);
         id
     }
 
@@ -273,10 +300,10 @@ impl<'a> Scanner<'a> {
         hunks: Vec<BlameHunk>,
     ) -> BTreeMap<String, Vec<(i64, BlameHunk)>> {
         let mut by_commit: BTreeMap<String, Vec<(i64, BlameHunk)>> = BTreeMap::new();
-        let repository_id = self.result.repository.id;
+        let repository_id = self.scan.repository.id;
         for hunk in hunks {
             let span_id = self.next_id.blame_span.alloc();
-            self.result.blame_spans.push(BlameSpan {
+            self.scan.blame_spans.push(BlameSpan {
                 id: span_id,
                 request_id: request.id,
                 repository_id,
@@ -304,10 +331,10 @@ impl<'a> Scanner<'a> {
         spans: &[(i64, BlameHunk)],
         edge_type: LineageEdgeType,
     ) {
-        let scan_id = self.result.scan.id;
+        let scan_id = self.scan.row.id;
         for (span_id, _) in spans {
             let edge_id = self.next_id.lineage_edge.alloc();
-            self.result.lineage_edges.push(LineageEdge {
+            self.scan.lineage_edges.push(LineageEdge {
                 id: edge_id,
                 scan_id,
                 from_request_id: request.id,
@@ -328,12 +355,12 @@ impl<'a> Scanner<'a> {
         actions: Vec<RecurseAction>,
     ) {
         let parent_position: Option<i64> = position.into();
-        let scan_id = self.result.scan.id;
+        let scan_id = self.scan.row.id;
         for action in actions {
             match action {
                 RecurseAction::Terminal { span_id, edge_type } => {
                     let edge_id = self.next_id.lineage_edge.alloc();
-                    self.result.lineage_edges.push(LineageEdge {
+                    self.scan.lineage_edges.push(LineageEdge {
                         id: edge_id,
                         scan_id,
                         from_request_id: request.id,
@@ -359,7 +386,7 @@ impl<'a> Scanner<'a> {
                         BlameReason::ParentRecurse,
                     );
                     let edge_id = self.next_id.lineage_edge.alloc();
-                    self.result.lineage_edges.push(LineageEdge {
+                    self.scan.lineage_edges.push(LineageEdge {
                         id: edge_id,
                         scan_id,
                         from_request_id: request.id,
@@ -445,7 +472,39 @@ impl<'a> Scanner<'a> {
             })
     }
 
-    fn seed(&mut self, merge_base_id: Oid, head_id: Oid) -> Result<()> {
+    fn seed_line(
+        &mut self,
+        head_id: Oid,
+        path: String,
+        start_line: u32,
+        end_line: u32,
+    ) -> Result<()> {
+        self.store_commit(head_id)?;
+        let head_sha = head_id.to_string();
+        let scan_id = self.scan.row.id;
+
+        let seed_range_id = self.next_id.seed_range.alloc();
+        self.scan.seed_ranges.push(SeedRange {
+            id: seed_range_id,
+            scan_id,
+            commit_sha: head_sha.clone(),
+            path: path.clone(),
+            start_line: i64::from(start_line),
+            end_line: i64::from(end_line),
+            diff_hunk_id: None,
+        });
+        self.enqueue_request(
+            head_sha,
+            path,
+            i64::from(start_line),
+            i64::from(end_line),
+            0,
+            BlameReason::Seed,
+        );
+        Ok(())
+    }
+
+    fn seed_branch(&mut self, merge_base_id: Oid, head_id: Oid) -> Result<()> {
         if merge_base_id == head_id {
             info!("merge-base equals HEAD; nothing to seed");
             return Ok(());
@@ -453,7 +512,7 @@ impl<'a> Scanner<'a> {
         self.store_commit(head_id)?;
         let persisted = self.populate_diff(head_id, merge_base_id, ParentPos::Seed)?;
         let head_sha = head_id.to_string();
-        let scan_id = self.result.scan.id;
+        let scan_id = self.scan.row.id;
 
         for event in &persisted.events {
             let Some(new_path) = event.info.new_path.as_deref() else {
@@ -462,7 +521,7 @@ impl<'a> Scanner<'a> {
             for (hunk, &hunk_id) in event.info.hunks.iter().zip(&event.hunk_ids) {
                 for &(start, end) in &hunk.added_ranges {
                     let seed_range_id = self.next_id.seed_range.alloc();
-                    self.result.seed_ranges.push(SeedRange {
+                    self.scan.seed_ranges.push(SeedRange {
                         id: seed_range_id,
                         scan_id,
                         commit_sha: head_sha.clone(),
@@ -493,11 +552,11 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
-    /// Drain the work queue and return the assembled scan result.
-    pub fn run(mut self) -> Result<ScanResult> {
+    /// Drain the work queue and return the assembled scan.
+    pub fn run(mut self) -> Result<DbScan> {
         while let Some(request) = self.queue.pop_front() {
             self.process_request(request)?;
         }
-        Ok(self.result)
+        Ok(self.scan)
     }
 }
